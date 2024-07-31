@@ -1,0 +1,173 @@
+import discord
+from discord.ext import commands
+import logging
+import re
+
+# Set up logging
+logging.basicConfig(level=logging.DEBUG)
+
+intents = discord.Intents.default()
+intents.messages = True
+intents.reactions = True
+intents.guilds = True
+
+bot = commands.Bot(command_prefix='!', intents=intents)
+
+# Replace these with your actual channel IDs
+EVALUATION_CHANNEL_ID = 1266884162908979231
+TIER_CHANNELS = {
+    'S-Tier': 1266875770148487261,
+    'A-Tier': 1266875895042539530,
+    'B-Tier': 1266875921068068967,
+    'C-Tier': 1266875949555781632,
+    'D-Tier': 1267096973664583700,
+    'F-Tier': 1266876000835473459,
+}
+
+# Replace these with your actual custom emoji names and their corresponding IDs
+tier_mapping = {
+    '<:s_tier:1266875180383207536>': 'S-Tier',
+    '<:a_tier:1266875308456542269>': 'A-Tier',
+    '<:b_tier:1266875404904435764>': 'B-Tier',
+    '<:c_tier:1266875544700452916>': 'C-Tier',
+    '<:d_tier:1267097354994192498>': 'D-Tier',
+    '<:f_tier:1266875961069011014>': 'F-Tier',
+}
+# To store the last message ID and tier posted per evaluation message
+message_history = {}
+# To store the last evaluated tier per message
+message_last_tier = {}
+
+@bot.event
+async def on_ready():
+    logging.info(f'Bot is ready. Logged in as {bot.user}')
+
+@bot.event
+async def on_message(message):
+    if message.author.bot:
+        return
+
+    if message.channel.id == EVALUATION_CHANNEL_ID:
+        logging.info(f"Message received in evaluation channel: '{message.content}' from {message.author}")
+
+        # Automatically add reactions to the message
+        for emote in tier_mapping.keys():
+            await message.add_reaction(emote)
+            logging.info(f"Added reaction {emote} to message ID {message.id}")
+
+    await bot.process_commands(message)
+
+@bot.event
+async def on_reaction_add(reaction, user):
+    if user.bot:
+        return
+
+    if reaction.message.channel.id == EVALUATION_CHANNEL_ID:
+        logging.info(f"Reaction added: {reaction.emoji} by {user}. Message ID: {reaction.message.id}")
+        await process_tier_list(reaction.message)
+
+@bot.event
+async def on_reaction_remove(reaction, user):
+    if user.bot:
+        return
+
+    if reaction.message.channel.id == EVALUATION_CHANNEL_ID:
+        logging.info(f"Reaction removed: {reaction.emoji} by {user}. Message ID: {reaction.message.id}")
+        await process_tier_list(reaction.message)
+
+async def process_tier_list(message):
+    try:
+        # Calculate tier counts based on reactions
+        tier_counts = {tier: 0 for tier in tier_mapping.values()}
+        for reaction in message.reactions:
+            if str(reaction.emoji) in tier_mapping:
+                async for user in reaction.users():
+                    if not user.bot:
+                        tier = tier_mapping.get(str(reaction.emoji))
+                        if tier:
+                            tier_counts[tier] += 1
+
+        total_reactions = sum(tier_counts.values())
+        if total_reactions < 1:
+            logging.info("Insufficient reactions found. At least one reaction is required.")
+            return
+
+        # Calculate average tier
+        average_tier = calculate_average_tier(tier_counts, total_reactions)
+        previous_message_info = message_history.get(message.id)
+
+        # Only proceed if the tier has changed or there's no previous message
+        if previous_message_info is None or previous_message_info[1] != TIER_CHANNELS.get(average_tier):
+            if average_tier in TIER_CHANNELS:
+                target_channel = bot.get_channel(TIER_CHANNELS[average_tier])
+                if target_channel:
+                    # Attempt to delete the previous message if it exists
+                    if previous_message_info:
+                        old_message_id, old_channel_id = previous_message_info
+                        try:
+                            old_channel = bot.get_channel(old_channel_id)
+                            if old_channel:
+                                old_message = await old_channel.fetch_message(old_message_id)
+                                await old_message.delete()
+                                logging.info(f"Deleted old message ID {old_message_id} from channel {old_channel_id}")
+                        except (discord.NotFound, discord.Forbidden):
+                            logging.warning(f"Could not delete old message ID {old_message_id}")
+                        except Exception as e:
+                            logging.error(f"Unexpected error deleting old message: {e}")
+
+                    # Gather all unique URLs from attachments and message content
+                    attachment_urls = {attachment.url for attachment in message.attachments}
+                    extracted_urls = {url for url in re.findall(r'(https?://\S+)', message.content)}
+                    all_urls = list(attachment_urls | extracted_urls)
+
+                    # Post URLs directly to allow Discord to handle preview
+                    if all_urls:
+                        content_to_post = '\n'.join(all_urls)
+                        sent_message = await target_channel.send(content=content_to_post)
+
+                        # Store the newly posted message details
+                        message_history[message.id] = (sent_message.id, target_channel.id)
+                        message_last_tier[message.id] = average_tier
+                        logging.info(f"Posted to {average_tier} channel: {target_channel.name}")
+                    else:
+                        logging.info("No URLs or attachments to post.")
+                else:
+                    logging.error(f"Target channel for {average_tier} not found.")
+            else:
+                logging.error(f"Average tier {average_tier} does not match any defined tier channels.")
+        else:
+            logging.info(f"No significant change detected for message {message.id}, skipping update.")
+    except Exception as e:
+        logging.error(f"Error in process_tier_list: {e}")
+
+def calculate_average_tier(tier_counts, total_reactions):
+    try:
+        tier_values = {
+            'S-Tier': 6,
+            'A-Tier': 5,
+            'B-Tier': 4,
+            'C-Tier': 3,
+            'D-Tier': 2,
+            'F-Tier': 1,
+        }
+
+        weighted_sum = sum(tier_values[tier] * count for tier, count in tier_counts.items())
+        average_value = weighted_sum / total_reactions
+
+        if average_value >= 5.5:
+            return 'S-Tier'
+        elif average_value >= 4.5:
+            return 'A-Tier'
+        elif average_value >= 3.5:
+            return 'B-Tier'
+        elif average_value >= 2.5:
+            return 'C-Tier'
+        elif average_value >= 1.5:
+            return 'D-Tier'
+        else:
+            return 'F-Tier'
+    except Exception as e:
+        logging.error(f"Error in calculate_average_tier: {e}")
+        return 'Error'
+
+bot.run('placeholder')
